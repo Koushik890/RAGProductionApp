@@ -1,16 +1,17 @@
 import logging
+import datetime
+import os
+import uuid
 
 from fastapi import FastAPI
 import inngest
 import inngest.fast_api
-from dotenv import load_dotenv
-import uuid
-import os
-import datetime
 from inngest.experimental import ai
+from dotenv import load_dotenv
+
+from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
 from data_loader import EMBED_DIM, load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
-from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
 
 load_dotenv()
 storage = None
@@ -43,10 +44,13 @@ inngest_client = inngest.Inngest(
 
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
-    # Event that triggers this function
-    trigger=inngest.TriggerEvent(event="rag/ingest_pdf")
+    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
+    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/Mistral
+    concurrency=[inngest.Concurrency(limit=5)],
+    # Throttle to max 10 ingestions per minute
+    throttle=inngest.Throttle(limit=10, period=datetime.timedelta(minutes=1)),
+    retries=3,
 )
-
 async def rag_ingest_pdf(ctx: inngest.Context):
     def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
         pdf_path = ctx.event.data["pdf_path"]
@@ -69,9 +73,13 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 
 @inngest_client.create_function(
     fn_id="RAG: Query PDF",
-    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
+    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"),
+    # Limit queries to 10 concurrent runs
+    concurrency=[inngest.Concurrency(limit=10)],
+    # Rate limit: max 30 queries per minute
+    rate_limit=inngest.RateLimit(limit=30, period=datetime.timedelta(minutes=1)),
+    retries=2,
 )
-
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
         query_vec = embed_texts([question])[0]

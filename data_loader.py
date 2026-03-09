@@ -1,3 +1,5 @@
+import os
+
 from mistralai import Mistral
 from llama_index.readers.file import PDFReader
 from llama_index.core.node_parser import SentenceSplitter
@@ -5,12 +7,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Mistral()
-
 EMBED_MODEL = "mistral-embed"
-EMBED_DIM = 3072
+EMBED_DIM = int(os.getenv("MISTRAL_EMBED_DIM", "1024"))
 
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+
+
+def get_mistral_client() -> Mistral:
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise RuntimeError("MISTRAL_API_KEY is not set")
+
+    return Mistral(api_key=api_key)
 
 def load_and_chunk_pdf(path: str):
     docs = PDFReader().load_data(file=path)
@@ -20,9 +28,13 @@ def load_and_chunk_pdf(path: str):
         chunks.extend(splitter.split_text(t))
     return chunks
 
-def embed_text(texts: list[str]) -> list[list[float]]:
-    response = client.embeddings.create(
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+
+    response = get_mistral_client().embeddings.create(
         model=EMBED_MODEL,
-        input=texts,
+        inputs=texts,
     )
     return [item.embedding for item in response.data]

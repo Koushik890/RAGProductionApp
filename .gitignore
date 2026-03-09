@@ -9,6 +9,8 @@ wheels/
 .venv
 # Secrets and config
 .env
+# Local vector storage
+qdrant_local_storage/
 # IDE files
 .idea/
 .specstory/

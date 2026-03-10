@@ -85,8 +85,8 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 @inngest_client.create_function(
     fn_id="RAG: Query PDF",
     trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"),
-    # Limit queries to 10 concurrent runs
-    concurrency=[inngest.Concurrency(limit=10)],
+    # Limit queries to 5 concurrent runs (Inngest free plan cap)
+    concurrency=[inngest.Concurrency(limit=5)],
     # Rate limit: max 30 queries per minute
     rate_limit=inngest.RateLimit(limit=30, period=datetime.timedelta(minutes=1)),
     retries=2,

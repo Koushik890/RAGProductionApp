@@ -193,7 +193,9 @@ async def upload_pdf(file: UploadFile = File(...)):
         )
     )
 
-    return {"status": "ingestion_triggered", "source_id": file.filename, "event_id": event_ids[0]}
+    # Wait for ingestion to complete so the user can query immediately after
+    output = await poll_inngest_run(event_ids[0], timeout_s=300.0)
+    return {"status": "ingestion_complete", "source_id": file.filename, **output}
 
 
 class QueryRequest(BaseModel):

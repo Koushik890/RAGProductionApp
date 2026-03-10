@@ -16,15 +16,15 @@ st.title("Upload a PDF to Ingest")
 uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=False)
 
 if uploaded is not None:
-    with st.spinner("Uploading and ingesting..."):
+    with st.spinner("Uploading and ingesting — this may take a minute..."):
         resp = requests.post(
             f"{BACKEND_URL}/upload",
             files={"file": (uploaded.name, uploaded.getvalue(), "application/pdf")},
-            timeout=300,
+            timeout=600,
         )
     if resp.ok:
         data = resp.json()
-        st.success(f"Triggered ingestion for: {data['source_id']}")
+        st.success(f"Ingestion complete for: {data['source_id']}. You can now ask questions!")
     else:
         st.error(f"Upload failed: {resp.text}")
     st.caption("You can upload another PDF if you like.")

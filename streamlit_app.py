@@ -12,21 +12,29 @@ if not BACKEND_URL.startswith(("http://", "https://")):
     BACKEND_URL = f"https://{BACKEND_URL}"
 
 
+if "ingested_files" not in st.session_state:
+    st.session_state.ingested_files = set()
+
 st.title("Upload a PDF to Ingest")
 uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=False)
 
 if uploaded is not None:
-    with st.spinner("Uploading and ingesting — this may take a minute..."):
-        resp = requests.post(
-            f"{BACKEND_URL}/upload",
-            files={"file": (uploaded.name, uploaded.getvalue(), "application/pdf")},
-            timeout=600,
-        )
-    if resp.ok:
-        data = resp.json()
-        st.success(f"Ingestion complete for: {data['source_id']}. You can now ask questions!")
+    file_key = f"{uploaded.name}_{uploaded.size}"
+    if file_key not in st.session_state.ingested_files:
+        with st.spinner("Uploading and ingesting — this may take a minute..."):
+            resp = requests.post(
+                f"{BACKEND_URL}/upload",
+                files={"file": (uploaded.name, uploaded.getvalue(), "application/pdf")},
+                timeout=600,
+            )
+        if resp.ok:
+            data = resp.json()
+            st.session_state.ingested_files.add(file_key)
+            st.success(f"Ingestion complete for: {data['source_id']}. You can now ask questions!")
+        else:
+            st.error(f"Upload failed: {resp.text}")
     else:
-        st.error(f"Upload failed: {resp.text}")
+        st.success(f"Already ingested: {uploaded.name}. You can ask questions below!")
     st.caption("You can upload another PDF if you like.")
 
 st.divider()

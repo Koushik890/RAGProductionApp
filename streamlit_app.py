@@ -40,7 +40,6 @@ if uploaded is not None:
 st.divider()
 st.title("Ask a question about your PDFs")
 
-
 with st.form("rag_query_form"):
     question = st.text_input("Your question")
     top_k = st.number_input(
@@ -54,23 +53,23 @@ with st.form("rag_query_form"):
     st.caption("The app reads this many text pieces before answering. Try 5 for a good balance.")
     submitted = st.form_submit_button("Ask")
 
-    if submitted and question.strip():
-        with st.spinner("Generating answer..."):
-            resp = requests.post(
-                f"{BACKEND_URL}/query",
-                json={"question": question.strip(), "top_k": int(top_k)},
-                timeout=120,
-            )
-        if resp.ok:
-            output = resp.json()
-            answer = output.get("answer", "")
-            sources = output.get("sources", [])
+if submitted and question.strip():
+    with st.spinner("Generating answer..."):
+        resp = requests.post(
+            f"{BACKEND_URL}/query",
+            json={"question": question.strip(), "top_k": int(top_k)},
+            timeout=120,
+        )
+    if resp.ok:
+        output = resp.json()
+        answer = output.get("answer", "")
+        sources = output.get("sources", [])
 
-            st.subheader("Answer")
-            st.write(answer or "(No answer)")
-            if sources:
-                st.caption("Sources")
-                for s in sources:
-                    st.write(f"- {s}")
-        else:
-            st.error(f"Query failed: {resp.text}")
+        st.subheader("Answer")
+        st.write(answer or "(No answer)")
+        if sources:
+            st.caption("Sources")
+            for s in sources:
+                st.write(f"- {s}")
+    else:
+        st.error(f"Query failed: {resp.text}")

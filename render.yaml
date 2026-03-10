@@ -6,7 +6,7 @@ services:
   - type: web
     name: rag-api
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
@@ -29,18 +29,12 @@ services:
         sync: false                    # Inngest Cloud signing key
       - key: INNGEST_API_BASE
         value: "https://api.inngest.com/v1"  # Inngest Cloud API
-      - key: UPLOADS_DIR
-        value: /opt/render/project/src/uploads
-    disk:
-      name: rag-uploads
-      mountPath: /opt/render/project/src/uploads
-      sizeGB: 1
 
   # ── Streamlit frontend ──────────────────────────────────────────
   - type: web
     name: rag-ui
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
     envVars:

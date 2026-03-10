@@ -39,7 +39,4 @@ services:
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: BACKEND_URL
-        fromService:
-          name: rag-api
-          type: web
-          property: host           # resolves to https://rag-api.onrender.com
+        value: "https://rag-api-a811.onrender.com"

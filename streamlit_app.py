@@ -7,7 +7,9 @@ load_dotenv()
 
 st.set_page_config(page_title="RAG Ingest PDF", page_icon="📄", layout="centered")
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+if not BACKEND_URL.startswith(("http://", "https://")):
+    BACKEND_URL = f"https://{BACKEND_URL}"
 
 
 st.title("Upload a PDF to Ingest")

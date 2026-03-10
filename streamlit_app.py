@@ -14,6 +14,8 @@ if not BACKEND_URL.startswith(("http://", "https://")):
 
 if "ingested_files" not in st.session_state:
     st.session_state.ingested_files = set()
+if "ingestion_messages" not in st.session_state:
+    st.session_state.ingestion_messages = {}
 
 st.title("Upload a PDF to Ingest")
 uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=False)
@@ -30,11 +32,17 @@ if uploaded is not None:
         if resp.ok:
             data = resp.json()
             st.session_state.ingested_files.add(file_key)
-            st.success(f"Ingestion complete for: {data['source_id']}. You can now ask questions!")
+            message = f"Ingestion complete for: {data['source_id']}. You can now ask questions!"
+            st.session_state.ingestion_messages[file_key] = message
+            st.success(message)
         else:
             st.error(f"Upload failed: {resp.text}")
     else:
-        st.success(f"Already ingested: {uploaded.name}. You can ask questions below!")
+        message = st.session_state.ingestion_messages.get(file_key)
+        if message:
+            st.success(message)
+        else:
+            st.success(f"Already ingested: {uploaded.name}. You can ask questions below!")
     st.caption("You can upload another PDF if you like.")
 
 st.divider()

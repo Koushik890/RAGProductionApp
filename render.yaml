@@ -1,0 +1,49 @@
+# Render Blueprint — RAG Production App
+# https://render.com/docs/blueprint-spec
+
+services:
+  # ── FastAPI backend ──────────────────────────────────────────────
+  - type: web
+    name: rag-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: MISTRAL_API_KEY
+        sync: false                    # set manually in the dashboard
+      - key: QDRANT_URL
+        sync: false                    # e.g. https://xyz.us-east.aws.cloud.qdrant.io:6333
+      - key: QDRANT_COLLECTION
+        value: docs
+      - key: MISTRAL_EMBED_DIM
+        value: "1024"
+      - key: INNGEST_PRODUCTION
+        value: "true"
+      - key: INNGEST_EVENT_KEY
+        sync: false                    # Inngest Cloud event key
+      - key: INNGEST_SIGNING_KEY
+        sync: false                    # Inngest Cloud signing key
+      - key: INNGEST_API_BASE
+        value: "https://api.inngest.com/v1"  # Inngest Cloud API
+      - key: UPLOADS_DIR
+        value: /opt/render/project/src/uploads
+    disk:
+      name: rag-uploads
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 1
+
+  # ── Streamlit frontend ──────────────────────────────────────────
+  - type: web
+    name: rag-ui
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: BACKEND_URL
+        fromService:
+          name: rag-api
+          type: web
+          property: host           # resolves to https://rag-api.onrender.com

@@ -1,13 +1,18 @@
+import asyncio
 import logging
 import datetime
 import os
+import time
 import uuid
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
 import inngest
 import inngest.fast_api
 from inngest.experimental import ai
 from dotenv import load_dotenv
+import requests as http_requests
 
 from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
 from data_loader import EMBED_DIM, load_and_chunk_pdf, embed_texts
@@ -35,10 +40,16 @@ def close_storage() -> None:
     storage.close()
     storage = None
 
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
+INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
+
 inngest_client = inngest.Inngest(
     app_id="rag_app",
     logger=logging.getLogger("uvicorn"),
-    is_production=False,
+    is_production=os.getenv("INNGEST_PRODUCTION", "false").lower() == "true",
     serializer=inngest.PydanticSerializer()
 )
 
@@ -122,6 +133,91 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
 
 app = FastAPI()
+
+
+# --------------- Inngest polling helper ------------------------------------
+
+
+async def poll_inngest_run(event_id: str, timeout_s: float = 120.0, poll_interval_s: float = 0.5) -> dict:
+    """Poll the Inngest API until the run triggered by *event_id* finishes."""
+    headers = {}
+    if INNGEST_SIGNING_KEY:
+        headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
+
+    url = f"{INNGEST_API_BASE}/events/{event_id}/runs"
+    start = time.time()
+
+    while True:
+        resp = await asyncio.to_thread(http_requests.get, url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        runs = resp.json().get("data", [])
+
+        if runs:
+            run = runs[0]
+            status = run.get("status")
+            if status in ("Completed", "Succeeded", "Success", "Finished"):
+                return run.get("output") or {}
+            if status in ("Failed", "Cancelled"):
+                raise HTTPException(status_code=502, detail=f"Inngest function run {status}")
+
+        if time.time() - start > timeout_s:
+            raise HTTPException(status_code=504, detail="Timed out waiting for Inngest run")
+
+        await asyncio.sleep(poll_interval_s)
+
+
+# --------------- API endpoints (routed through Inngest) --------------------
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    file_path = UPLOADS_DIR / file.filename
+    contents = await file.read()
+    file_path.write_bytes(contents)
+
+    event_ids = await inngest_client.send(
+        inngest.Event(
+            name="rag/ingest_pdf",
+            data={
+                "pdf_path": str(file_path.resolve()),
+                "source_id": file.filename,
+            },
+        )
+    )
+
+    return {"status": "ingestion_triggered", "source_id": file.filename, "event_id": event_ids[0]}
+
+
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+@app.post("/query")
+async def query_pdf(req: QueryRequest):
+    event_ids = await inngest_client.send(
+        inngest.Event(
+            name="rag/query_pdf_ai",
+            data={
+                "question": req.question,
+                "top_k": req.top_k,
+            },
+        )
+    )
+
+    output = await poll_inngest_run(event_ids[0])
+    return output
+
+
+# --------------- Register Inngest functions --------------------------------
 
 inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
 

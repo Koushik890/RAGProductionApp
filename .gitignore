@@ -11,6 +11,9 @@ wheels/
 .env
 # Local vector storage
 qdrant_local_storage/
+qdrant_storage/
+# Uploaded files
+uploads/
 # IDE files
 .idea/
 .specstory/

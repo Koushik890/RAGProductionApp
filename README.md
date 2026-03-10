@@ -247,4 +247,4 @@ For production, use:
 
 ## License
 
-Add your preferred license (for example MIT) in a `LICENSE` file.
+This project is licensed under the MIT License. See `LICENSE` for details.

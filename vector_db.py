@@ -16,7 +16,8 @@ class QdrantStorage:
     def _create_client(url=None, path=None):
         resolved_url = url or os.getenv("QDRANT_URL")
         if resolved_url:
-            return QdrantClient(url=resolved_url, timeout=30), True
+            api_key = os.getenv("QDRANT_API_KEY")
+            return QdrantClient(url=resolved_url, api_key=api_key, timeout=30), True
 
         resolved_path = path or os.getenv("QDRANT_PATH")
         if resolved_path is None:

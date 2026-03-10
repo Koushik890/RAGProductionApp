@@ -48,20 +48,27 @@ if uploaded is not None:
 st.divider()
 st.title("Ask a question about your PDFs")
 
+can_query = len(st.session_state.ingested_files) > 0
+if not can_query:
+    st.info("Upload and finish ingesting at least one PDF to enable questions.")
+
 with st.form("rag_query_form"):
-    question = st.text_input("Your question")
+    question = st.text_input("Your question", disabled=not can_query)
     top_k = st.number_input(
         "How many chunks to retrieve",
         min_value=1,
         max_value=20,
         value=5,
         step=1,
+        disabled=not can_query,
         help="How many text pieces the app reads before answering. 5 is a good default: lower is faster, higher gives more context.",
     )
     st.caption("The app reads this many text pieces before answering. Try 5 for a good balance.")
-    submitted = st.form_submit_button("Ask")
+    submitted = st.form_submit_button("Ask", disabled=not can_query)
 
-if submitted and question.strip():
+if submitted and not can_query:
+    st.warning("Please complete PDF upload and ingestion first.")
+elif submitted and question.strip():
     with st.spinner("Generating answer..."):
         resp = requests.post(
             f"{BACKEND_URL}/query",

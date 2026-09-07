@@ -93,6 +93,7 @@ App/UI configuration:
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `UPLOADS_DIR` | No | `uploads` | Directory where uploaded PDFs are stored. |
+| `MAX_UPLOAD_BYTES` | No | `20971520` | Maximum accepted PDF size in bytes. |
 | `BACKEND_URL` | No | `http://127.0.0.1:8000` | FastAPI base URL used by Streamlit UI. |
 
 ## Local Development Setup
@@ -163,17 +164,38 @@ Base URL: `http://127.0.0.1:8000`
 - `GET /health`
 	- Returns service health.
 
+- `GET /health/deps`
+	- Checks Mistral and Qdrant, the two dependencies every Inngest step needs.
+	- Response: `{ "mistral": {"ok": true}, "qdrant": {"ok": false, "error": "..."} }`
+	- Use it when a run fails: it names the broken dependency instead of leaving
+	  every failure looking the same.
+
 - `POST /upload`
 	- Accepts multipart form-data with a PDF file.
-	- Triggers ingestion and waits for completion.
-	- Returns ingestion status and source info.
+	- Queues ingestion and returns `202` immediately with an `event_id`.
+	- Response: `{ "status": "ingestion_started", "event_id": "...", "source_id": "..." }`
 
 - `POST /query`
 	- JSON body:
 		```json
 		{ "question": "What is this document about?", "top_k": 5 }
 		```
-	- Triggers query workflow and returns answer + sources.
+	- Queues the query workflow and returns `202` with an `event_id`.
+	- Response: `{ "status": "query_started", "event_id": "..." }`
+
+- `GET /status/{event_id}`
+	- Polls the Inngest run started by `/upload` or `/query`.
+	- Returns one of:
+		- `{ "state": "pending" }` - no run created yet
+		- `{ "state": "running", "status": "..." }`
+		- `{ "state": "completed", "output": { ... } }`
+		- `{ "state": "failed", "error": { ... } }`
+	- Returns `429` with a `Retry-After` header if the Inngest API rate limits the poll.
+
+Both long-running workflows are polled rather than awaited inside the request.
+Holding a request open for the whole ingestion piles up long-lived connections
+on the instance and trips upstream rate limiting - that is the `Too Many Requests`
+the UI used to show.
 
 Interactive API docs:
 - `http://127.0.0.1:8000/docs`
@@ -185,6 +207,12 @@ Upload a PDF:
 ```bash
 curl -X POST "http://127.0.0.1:8000/upload" \
 	-F "file=@./sample.pdf"
+```
+
+Then poll the run until it finishes:
+
+```bash
+curl "http://127.0.0.1:8000/status/<event_id>"
 ```
 
 Ask a question:

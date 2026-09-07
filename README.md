@@ -11,7 +11,7 @@ This repository provides:
 - A `Streamlit` frontend for uploading PDFs and asking questions.
 - `Inngest` functions to orchestrate ingestion and query workflows.
 - `Qdrant` vector storage (local embedded mode or remote cloud mode).
-- `OpenRouter` for embeddings and LLM inference (NVIDIA Nemotron models by default).
+- `NVIDIA NIM` for embeddings and LLM inference (any OpenAI-compatible provider works).
 
 ## What This App Does
 
@@ -45,13 +45,13 @@ Core modules:
 - Streamlit
 - Inngest
 - Qdrant
-- OpenRouter API (OpenAI-compatible)
+- NVIDIA NIM API (OpenAI-compatible)
 - LlamaIndex file reader + text splitter
 
 ## Prerequisites
 
 - Python `3.13` (see `.python-version`)
-- An OpenRouter API key
+- An NVIDIA NIM API key from build.nvidia.com
 - One of the following for vector storage:
 	- Local embedded Qdrant (default, no extra service required)
 	- Qdrant Cloud / remote Qdrant (`QDRANT_URL` + `QDRANT_API_KEY`)
@@ -67,15 +67,15 @@ Required for core functionality:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `OPENROUTER_API_KEY` | Yes | - | API key for embeddings and answer generation. |
-| `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL. |
-| `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b:free` | Embedding model. |
-| `ANSWER_MODEL` | No | `nvidia/nemotron-3-super-120b-a12b:free` | Answer generation model. |
+| `LLM_API_KEY` | Yes | - | API key for embeddings and answer generation. `NVIDIA_API_KEY`, `NIM_API_KEY` and `OPENROUTER_API_KEY` are also accepted. |
+| `LLM_BASE_URL` | No | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible base URL. Point it at another provider to switch. |
+| `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b` | Embedding model. Produces 2048-dim vectors. |
+| `ANSWER_MODEL` | No | `nvidia/nemotron-3-super-120b-a12b` | Answer generation model. |
 | `EMBED_DIM` | No | probed once | Embedding vector size. Leave unset to detect it from the model. |
 | `EMBED_BATCH_SIZE` | No | `64` | Chunks sent per embedding request. |
+| `EMBED_INPUT_TYPE` | No | auto | Send NVIDIA's `input_type`/`truncate` parameters. Auto-enabled for NVIDIA endpoints. |
+| `EMBED_TRUNCATE` | No | `END` | How NIM truncates input longer than the model context. |
 | `ANSWER_MAX_TOKENS` | No | `4096` | Token budget for the answer, including reasoning tokens. |
-| `OPENROUTER_SITE_URL` | No | unset | Optional `HTTP-Referer` for OpenRouter attribution. |
-| `OPENROUTER_APP_NAME` | No | unset | Optional `X-Title` for OpenRouter attribution. |
 
 Qdrant configuration:
 
@@ -130,11 +130,12 @@ uv sync
 Create `.env` with at least:
 
 ```env
-OPENROUTER_API_KEY=your_openrouter_key
+LLM_API_KEY=your_nvidia_nim_key
 QDRANT_COLLECTION=docs
-# Optional: pin the models. These are the defaults.
-EMBED_MODEL=nvidia/nemotron-3-embed-1b:free
-ANSWER_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+# Optional: pin provider and models. These are the defaults.
+LLM_BASE_URL=https://integrate.api.nvidia.com/v1
+EMBED_MODEL=nvidia/nemotron-3-embed-1b
+ANSWER_MODEL=nvidia/nemotron-3-super-120b-a12b
 ```
 
 For local embedded Qdrant, no extra setup is required.
@@ -237,7 +238,7 @@ curl -X POST "http://127.0.0.1:8000/query" \
 - `rag-api`: FastAPI backend
 - `rag-ui`: Streamlit frontend
 
-Set sensitive values (`OPENROUTER_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
+Set sensitive values (`LLM_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
 
 For production, use:
 - Inngest Cloud (`INNGEST_API_BASE=https://api.inngest.com/v1`)
@@ -252,14 +253,16 @@ For production, use:
   to raise an error instead of dropping a remote collection.
 - Changing `EMBED_MODEL` therefore invalidates everything already ingested.
 - `/upload` returns immediately; the client polls `/status/{event_id}` until the run ends.
-- Free OpenRouter models (`:free` suffix) are limited to 20 requests/minute and
-  50/day per account, shared across all free models. Switch to a paid model id to
-  remove the daily cap.
+- NVIDIA NIM's free tier is rate limited per minute (roughly 40 requests) rather
+  than capped per day. Handle 429 with backoff; the app already does.
+- NVIDIA embedding models are asymmetric: documents are embedded with
+  `input_type=passage` and questions with `input_type=query`. Mixing the two
+  degrades retrieval.
 
 ## Troubleshooting
 
-- `RuntimeError: OPENROUTER_API_KEY is not set`
-	- Add `OPENROUTER_API_KEY` to `.env` and restart services.
+- `RuntimeError: No API key set`
+	- Add `LLM_API_KEY` to `.env` and restart services.
 
 - Every ingestion and query fails with the same error
 	- Call `GET /health/deps` to see whether the embedding provider or Qdrant is broken.

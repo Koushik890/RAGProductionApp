@@ -16,7 +16,14 @@ from dotenv import load_dotenv
 import requests as http_requests
 
 from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
-from data_loader import EmbeddingQuotaExceeded, get_embed_dim, load_and_chunk_pdf, embed_texts
+from data_loader import (
+    LLM_BASE_URL,
+    EmbeddingQuotaExceeded,
+    embed_texts,
+    get_api_key,
+    get_embed_dim,
+    load_and_chunk_pdf,
+)
 from vector_db import QdrantStorage, create_client
 
 load_dotenv()
@@ -46,8 +53,7 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-ANSWER_MODEL = os.getenv("ANSWER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
 
 INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").rstrip("/")
@@ -63,7 +69,7 @@ inngest_client = inngest.Inngest(
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
     trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
-    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/OpenRouter
+    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/the LLM provider
     concurrency=[inngest.Concurrency(limit=5)],
     # Throttle to max 10 ingestions per minute
     throttle=inngest.Throttle(limit=10, period=datetime.timedelta(minutes=1)),
@@ -80,7 +86,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
         chunks = chunks_and_src.chunks
         source_id = chunks_and_src.source_id
         try:
-            vecs = embed_texts(chunks)
+            vecs = embed_texts(chunks, input_type="passage")
         except EmbeddingQuotaExceeded as exc:
             # Retrying spends more of an already-exhausted quota without ever
             # succeeding, so fail the run immediately with a readable reason.
@@ -106,7 +112,9 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
         try:
-            query_vec = embed_texts([question])[0]
+            # A question is a query, not a document. Asymmetric embedding
+            # models score the two differently, so the label matters.
+            query_vec = embed_texts([question], input_type="query")[0]
         except EmbeddingQuotaExceeded as exc:
             raise inngest.NonRetriableError(str(exc)) from exc
         found = get_storage().search(query_vec, top_k)
@@ -126,8 +134,8 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     )
 
     adapter = ai.openai.Adapter(
-        auth_key=os.getenv("OPENROUTER_API_KEY"),
-        base_url=OPENROUTER_BASE_URL,
+        auth_key=get_api_key(),
+        base_url=LLM_BASE_URL,
         model=ANSWER_MODEL,
     )
 
@@ -261,6 +269,7 @@ async def health_deps():
 
     def _check_embeddings() -> int:
         return get_embed_dim()
+
 
     def _check_qdrant() -> list[str]:
         # Deliberately avoids get_embed_dim(): the two checks must fail

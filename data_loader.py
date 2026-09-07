@@ -8,15 +8,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nemotron-3-embed-1b:free")
+# Any OpenAI-compatible provider works. Defaults point at NVIDIA NIM, which
+# serves the Nemotron models first-party and rate limits per minute rather than
+# capping requests per day.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nemotron-3-embed-1b")
 
 # The embedding endpoint has a finite context window, so long documents are sent
-# in batches. Larger batches mean fewer requests, which matters because free
-# OpenRouter models are capped at 20 requests/minute and 50/day per account.
+# in batches. Larger batches mean fewer requests, which keeps us clear of
+# per-minute rate limits.
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
 
+# NVIDIA embedding models are asymmetric: a document and a question about that
+# document must be embedded differently for retrieval to work well. Providers
+# that do not accept the parameter would reject the request, so it is only sent
+# to NVIDIA endpoints unless forced with EMBED_INPUT_TYPE=1 or 0.
+def _input_type_supported() -> bool:
+    forced = os.getenv("EMBED_INPUT_TYPE")
+    if forced is not None:
+        return forced.strip().lower() in ("1", "true", "yes")
+    return "api.nvidia.com" in LLM_BASE_URL
+
+
+# NIM rejects input longer than the model context unless told how to truncate.
+EMBED_TRUNCATE = os.getenv("EMBED_TRUNCATE", "END")
+
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+
+
+def get_api_key() -> str:
+    """Read the provider key, accepting the older provider-specific names."""
+    for name in ("LLM_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY", "OPENROUTER_API_KEY"):
+        value = os.getenv(name)
+        if value:
+            return value
+    raise RuntimeError("No API key set. Provide LLM_API_KEY (or NVIDIA_API_KEY).")
 
 
 class EmbeddingQuotaExceeded(RuntimeError):
@@ -45,12 +71,10 @@ def get_client() -> OpenAI:
     if _client is None:
         with _client_lock:
             if _client is None:
-                api_key = os.getenv("OPENROUTER_API_KEY")
-                if not api_key:
-                    raise RuntimeError("OPENROUTER_API_KEY is not set")
+                api_key = get_api_key()
 
                 # Optional attribution headers; OpenRouter uses them for its
-                # public leaderboards and ignores them when absent.
+                # public leaderboards, other providers ignore them.
                 default_headers = {}
                 site_url = os.getenv("OPENROUTER_SITE_URL")
                 app_name = os.getenv("OPENROUTER_APP_NAME")
@@ -60,7 +84,7 @@ def get_client() -> OpenAI:
                     default_headers["X-Title"] = app_name
 
                 _client = OpenAI(
-                    base_url=OPENROUTER_BASE_URL,
+                    base_url=LLM_BASE_URL,
                     api_key=api_key,
                     timeout=60.0,
                     max_retries=2,
@@ -79,17 +103,24 @@ def load_and_chunk_pdf(path: str):
     return chunks
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(texts: list[str], input_type: str = "passage") -> list[list[float]]:
+    """Embed *texts*. Use input_type="query" for a question, "passage" for a document."""
     if not texts:
         return []
 
     client = get_client()
+    extra_body = {}
+    if _input_type_supported():
+        extra_body = {"input_type": input_type, "truncate": EMBED_TRUNCATE}
+
     vectors: list[list[float]] = []
 
     for start in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[start : start + EMBED_BATCH_SIZE]
         try:
-            response = client.embeddings.create(model=EMBED_MODEL, input=batch)
+            response = client.embeddings.create(
+                model=EMBED_MODEL, input=batch, extra_body=extra_body
+            )
         except RateLimitError as exc:
             if _is_daily_quota(exc):
                 raise EmbeddingQuotaExceeded(
@@ -120,6 +151,6 @@ def get_embed_dim() -> int:
                 if override:
                     _embed_dim = int(override)
                 else:
-                    _embed_dim = len(embed_texts(["dimension probe"])[0])
+                    _embed_dim = len(embed_texts(["dimension probe"], input_type="query")[0])
 
     return _embed_dim

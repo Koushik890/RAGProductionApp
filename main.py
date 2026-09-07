@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 import requests as http_requests
 
 from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
-from data_loader import EMBED_DIM, load_and_chunk_pdf, embed_texts
+from data_loader import get_embed_dim, load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
 
 load_dotenv()
@@ -27,7 +27,7 @@ def get_storage() -> QdrantStorage:
     global storage
 
     if storage is None:
-        storage = QdrantStorage(dim=EMBED_DIM)
+        storage = QdrantStorage(dim=get_embed_dim())
 
     return storage
 
@@ -46,6 +46,10 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
+
 INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").rstrip("/")
 INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
 
@@ -59,7 +63,7 @@ inngest_client = inngest.Inngest(
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
     trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
-    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/Mistral
+    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/OpenRouter
     concurrency=[inngest.Concurrency(limit=5)],
     # Throttle to max 10 ingestions per minute
     throttle=inngest.Throttle(limit=10, period=datetime.timedelta(minutes=1)),
@@ -114,16 +118,18 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     )
 
     adapter = ai.openai.Adapter(
-        auth_key=os.getenv("MISTRAL_API_KEY"),
-        base_url="https://api.mistral.ai/v1",
-        model="mistral-large-latest",
+        auth_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url=OPENROUTER_BASE_URL,
+        model=ANSWER_MODEL,
     )
 
     res = await ctx.step.ai.infer(
         "llm-answer",
         adapter=adapter,
         body={
-            "max_tokens": 1024,
+            # Reasoning models spend part of this budget thinking before they
+            # emit any answer text, so it has to be well above the answer length.
+            "max_tokens": ANSWER_MAX_TOKENS,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": "You answer questions using only the provided context."},
@@ -132,7 +138,15 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
         }
     )
 
-    answer = res["choices"][0]["message"]["content"].strip()
+    message = res["choices"][0]["message"]
+    answer = (message.get("content") or "").strip()
+    if not answer:
+        # Reasoning models sometimes leave `content` null and put the text in
+        # `reasoning` instead. Fall back rather than crashing on None.
+        answer = (message.get("reasoning") or "").strip()
+    if not answer:
+        raise RuntimeError("The model returned an empty answer")
+
     return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
 
 app = FastAPI()
@@ -217,21 +231,21 @@ def health():
 async def health_deps():
     """Check the two dependencies every Inngest step needs.
 
-    Both `rag/ingest_pdf` and `rag/query_pdf_ai` fail identically when Mistral or
-    Qdrant is misconfigured, and the run error alone does not say which. This
-    names the broken one directly.
+    Both `rag/ingest_pdf` and `rag/query_pdf_ai` fail identically when the
+    embedding provider or Qdrant is misconfigured, and the run error alone does
+    not say which. This names the broken one directly.
     """
 
-    def _check_mistral() -> None:
+    def _check_embeddings() -> None:
         embed_texts(["ping"])
 
     def _check_qdrant() -> None:
         # Cosine distance rejects a zero vector, so probe with a unit vector.
-        probe = [1.0] + [0.0] * (EMBED_DIM - 1)
+        probe = [1.0] + [0.0] * (get_embed_dim() - 1)
         get_storage().search(probe, 1)
 
     results: dict[str, dict] = {}
-    for name, check in (("mistral", _check_mistral), ("qdrant", _check_qdrant)):
+    for name, check in (("embeddings", _check_embeddings), ("qdrant", _check_qdrant)):
         try:
             await asyncio.to_thread(check)
         except Exception as exc:

@@ -11,14 +11,14 @@ This repository provides:
 - A `Streamlit` frontend for uploading PDFs and asking questions.
 - `Inngest` functions to orchestrate ingestion and query workflows.
 - `Qdrant` vector storage (local embedded mode or remote cloud mode).
-- `Mistral` embeddings and LLM inference.
+- `OpenRouter` for embeddings and LLM inference (NVIDIA Nemotron models by default).
 
 ## What This App Does
 
 1. You upload a PDF from the Streamlit UI.
 2. The backend extracts text, chunks it, creates embeddings, and stores vectors in Qdrant.
 3. You ask a question.
-4. The backend retrieves relevant chunks, sends context to Mistral, and returns a grounded answer with sources.
+4. The backend retrieves relevant chunks, sends context to the answer model, and returns a grounded answer with sources.
 
 ## Architecture
 
@@ -45,13 +45,13 @@ Core modules:
 - Streamlit
 - Inngest
 - Qdrant
-- Mistral API
+- OpenRouter API (OpenAI-compatible)
 - LlamaIndex file reader + text splitter
 
 ## Prerequisites
 
 - Python `3.13` (see `.python-version`)
-- A Mistral API key
+- An OpenRouter API key
 - One of the following for vector storage:
 	- Local embedded Qdrant (default, no extra service required)
 	- Qdrant Cloud / remote Qdrant (`QDRANT_URL` + `QDRANT_API_KEY`)
@@ -67,8 +67,15 @@ Required for core functionality:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `MISTRAL_API_KEY` | Yes | - | API key for embeddings and answer generation. |
-| `MISTRAL_EMBED_DIM` | No | `1024` | Embedding vector dimension used for Qdrant collection. |
+| `OPENROUTER_API_KEY` | Yes | - | API key for embeddings and answer generation. |
+| `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL. |
+| `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b:free` | Embedding model. |
+| `ANSWER_MODEL` | No | `nvidia/nemotron-3-super-120b-a12b:free` | Answer generation model. |
+| `EMBED_DIM` | No | probed once | Embedding vector size. Leave unset to detect it from the model. |
+| `EMBED_BATCH_SIZE` | No | `64` | Chunks sent per embedding request. |
+| `ANSWER_MAX_TOKENS` | No | `4096` | Token budget for the answer, including reasoning tokens. |
+| `OPENROUTER_SITE_URL` | No | unset | Optional `HTTP-Referer` for OpenRouter attribution. |
+| `OPENROUTER_APP_NAME` | No | unset | Optional `X-Title` for OpenRouter attribution. |
 
 Qdrant configuration:
 
@@ -123,10 +130,11 @@ uv sync
 Create `.env` with at least:
 
 ```env
-MISTRAL_API_KEY=your_mistral_key
-# Optional but recommended for clarity
-MISTRAL_EMBED_DIM=1024
+OPENROUTER_API_KEY=your_openrouter_key
 QDRANT_COLLECTION=docs
+# Optional: pin the models. These are the defaults.
+EMBED_MODEL=nvidia/nemotron-3-embed-1b:free
+ANSWER_MODEL=nvidia/nemotron-3-super-120b-a12b:free
 ```
 
 For local embedded Qdrant, no extra setup is required.
@@ -165,8 +173,8 @@ Base URL: `http://127.0.0.1:8000`
 	- Returns service health.
 
 - `GET /health/deps`
-	- Checks Mistral and Qdrant, the two dependencies every Inngest step needs.
-	- Response: `{ "mistral": {"ok": true}, "qdrant": {"ok": false, "error": "..."} }`
+	- Checks the embedding provider and Qdrant, the two dependencies every Inngest step needs.
+	- Response: `{ "embeddings": {"ok": true}, "qdrant": {"ok": false, "error": "..."} }`
 	- Use it when a run fails: it names the broken dependency instead of leaving
 	  every failure looking the same.
 
@@ -229,7 +237,7 @@ curl -X POST "http://127.0.0.1:8000/query" \
 - `rag-api`: FastAPI backend
 - `rag-ui`: Streamlit frontend
 
-Set sensitive values (`MISTRAL_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
+Set sensitive values (`OPENROUTER_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
 
 For production, use:
 - Inngest Cloud (`INNGEST_API_BASE=https://api.inngest.com/v1`)
@@ -238,21 +246,31 @@ For production, use:
 ## Operational Notes
 
 - Local mode defaults to embedded Qdrant storage in `qdrant_local_storage/`.
-- If embedding dimension changes, local collection is recreated automatically.
-- If using remote Qdrant and dimensions do not match, startup raises an error (collection must be recreated or config corrected).
-- `/upload` waits for ingestion completion, so first response can take time for larger PDFs.
+- The embedding vector size is probed once from `EMBED_MODEL` unless `EMBED_DIM` is set.
+- If the collection's vector size does not match the embedding model, it is dropped and
+  recreated, and every document must be re-uploaded. Set `QDRANT_ALLOW_RECREATE=false`
+  to raise an error instead of dropping a remote collection.
+- Changing `EMBED_MODEL` therefore invalidates everything already ingested.
+- `/upload` returns immediately; the client polls `/status/{event_id}` until the run ends.
+- Free OpenRouter models (`:free` suffix) are limited to 20 requests/minute and
+  50/day per account, shared across all free models. Switch to a paid model id to
+  remove the daily cap.
 
 ## Troubleshooting
 
-- `RuntimeError: MISTRAL_API_KEY is not set`
-	- Add `MISTRAL_API_KEY` to `.env` and restart services.
+- `RuntimeError: OPENROUTER_API_KEY is not set`
+	- Add `OPENROUTER_API_KEY` to `.env` and restart services.
+
+- Every ingestion and query fails with the same error
+	- Call `GET /health/deps` to see whether the embedding provider or Qdrant is broken.
 
 - Inngest polling timeout (`Timed out waiting for Inngest run`)
 	- Ensure Inngest dev/cloud is running and reachable.
 	- Confirm `INNGEST_API_BASE` and keys are correct.
 
 - Vector dimension mismatch with remote Qdrant
-	- Match `MISTRAL_EMBED_DIM` with collection dimension, or recreate collection.
+	- The collection is rebuilt automatically. Re-upload your PDFs afterwards.
+	- Set `EMBED_DIM` only if you want to skip the probe and pin the size yourself.
 
 - Streamlit cannot reach backend
 	- Verify `BACKEND_URL` and that FastAPI is running.

@@ -1,8 +1,21 @@
+import logging
 import os
 from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
+
+logger = logging.getLogger("uvicorn")
+
+
+def _recreate_allowed() -> bool:
+    """Whether a remote collection may be dropped when its vector size is wrong.
+
+    A collection built for a different embedding model cannot be searched or
+    written to, so the app is dead until it is rebuilt. Set
+    `QDRANT_ALLOW_RECREATE=false` to fail loudly instead of dropping it.
+    """
+    return os.getenv("QDRANT_ALLOW_RECREATE", "true").lower() != "false"
 
 
 class QdrantStorage:
@@ -37,12 +50,20 @@ class QdrantStorage:
         if current_dim == self.dim:
             return
 
-        if self.is_remote:
+        if self.is_remote and not _recreate_allowed():
             raise RuntimeError(
                 f"Collection '{self.collection}' is configured for vectors of size {current_dim}, "
-                f"but the app is configured for {self.dim}. Recreate the remote collection or update its dimension settings."
+                f"but the app is configured for {self.dim}. Recreate the remote collection, or set "
+                f"QDRANT_ALLOW_RECREATE=true to let the app rebuild it (this deletes its contents)."
             )
 
+        logger.warning(
+            "Collection '%s' has vector size %s but the embedding model produces %s. "
+            "Dropping and recreating it; all previously ingested documents must be re-uploaded.",
+            self.collection,
+            current_dim,
+            self.dim,
+        )
         self.client.delete_collection(self.collection)
         self._create_collection()
 

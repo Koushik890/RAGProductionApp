@@ -1,38 +1,60 @@
 import os
+import threading
 
-from mistralai import Mistral
-from mistralai.utils import BackoffStrategy, RetryConfig
+from openai import OpenAI
 from llama_index.readers.file import PDFReader
 from llama_index.core.node_parser import SentenceSplitter
 from dotenv import load_dotenv
 
 load_dotenv()
 
-EMBED_MODEL = "mistral-embed"
-EMBED_DIM = int(os.getenv("MISTRAL_EMBED_DIM", "1024"))
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nemotron-3-embed-1b:free")
+
+# The embedding endpoint has a finite context window, so long documents are sent
+# in batches. Larger batches mean fewer requests, which matters because free
+# OpenRouter models are capped at 20 requests/minute and 50/day per account.
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
 
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
 
+_client: OpenAI | None = None
+_client_lock = threading.Lock()
 
-def get_mistral_client() -> Mistral:
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        raise RuntimeError("MISTRAL_API_KEY is not set")
+_embed_dim: int | None = None
+_embed_dim_lock = threading.Lock()
 
-    return Mistral(
-        api_key=api_key,
-        timeout_ms=30_000,
-        retry_config=RetryConfig(
-            strategy="backoff",
-            backoff=BackoffStrategy(
-                initial_interval=500,
-                max_interval=10_000,
-                exponent=2.0,
-                max_elapsed_time=60_000,
-            ),
-            retry_connection_errors=True,
-        ),
-    )
+
+def get_client() -> OpenAI:
+    global _client
+
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                if not api_key:
+                    raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+                # Optional attribution headers; OpenRouter uses them for its
+                # public leaderboards and ignores them when absent.
+                default_headers = {}
+                site_url = os.getenv("OPENROUTER_SITE_URL")
+                app_name = os.getenv("OPENROUTER_APP_NAME")
+                if site_url:
+                    default_headers["HTTP-Referer"] = site_url
+                if app_name:
+                    default_headers["X-Title"] = app_name
+
+                _client = OpenAI(
+                    base_url=OPENROUTER_BASE_URL,
+                    api_key=api_key,
+                    timeout=60.0,
+                    max_retries=3,
+                    default_headers=default_headers or None,
+                )
+
+    return _client
+
 
 def load_and_chunk_pdf(path: str):
     docs = PDFReader().load_data(file=path)
@@ -47,8 +69,36 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
 
-    response = get_mistral_client().embeddings.create(
-        model=EMBED_MODEL,
-        inputs=texts,
-    )
-    return [item.embedding for item in response.data]
+    client = get_client()
+    vectors: list[list[float]] = []
+
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start : start + EMBED_BATCH_SIZE]
+        response = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        # The API may return items out of order, so sort by the index it reports.
+        ordered = sorted(response.data, key=lambda item: item.index)
+        vectors.extend(item.embedding for item in ordered)
+
+    return vectors
+
+
+def get_embed_dim() -> int:
+    """Vector size produced by EMBED_MODEL.
+
+    Set `EMBED_DIM` to skip the probe. Otherwise the size is measured once by
+    embedding a short string, so swapping embedding models does not require
+    hand-editing a dimension that then silently mismatches the Qdrant
+    collection.
+    """
+    global _embed_dim
+
+    if _embed_dim is None:
+        with _embed_dim_lock:
+            if _embed_dim is None:
+                override = os.getenv("EMBED_DIM")
+                if override:
+                    _embed_dim = int(override)
+                else:
+                    _embed_dim = len(embed_texts(["dimension probe"])[0])
+
+    return _embed_dim

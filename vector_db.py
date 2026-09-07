@@ -18,25 +18,30 @@ def _recreate_allowed() -> bool:
     return os.getenv("QDRANT_ALLOW_RECREATE", "true").lower() != "false"
 
 
+def create_client(url=None, path=None):
+    """Build a Qdrant client. Returns (client, is_remote).
+
+    Public so a connectivity check can run without knowing the embedding
+    dimension, which requires a live call to the embedding provider.
+    """
+    resolved_url = url or os.getenv("QDRANT_URL")
+    if resolved_url:
+        api_key = os.getenv("QDRANT_API_KEY")
+        return QdrantClient(url=resolved_url, api_key=api_key, timeout=30), True
+
+    resolved_path = path or os.getenv("QDRANT_PATH")
+    if resolved_path is None:
+        resolved_path = Path(__file__).resolve().parent / "qdrant_local_storage"
+
+    return QdrantClient(path=str(resolved_path), timeout=30), False
+
+
 class QdrantStorage:
     def __init__(self, url=None, path=None, collection=None, dim=1024):
         self.dim = dim
         self.collection = collection or os.getenv("QDRANT_COLLECTION", "docs")
-        self.client, self.is_remote = self._create_client(url=url, path=path)
+        self.client, self.is_remote = create_client(url=url, path=path)
         self._ensure_collection()
-
-    @staticmethod
-    def _create_client(url=None, path=None):
-        resolved_url = url or os.getenv("QDRANT_URL")
-        if resolved_url:
-            api_key = os.getenv("QDRANT_API_KEY")
-            return QdrantClient(url=resolved_url, api_key=api_key, timeout=30), True
-
-        resolved_path = path or os.getenv("QDRANT_PATH")
-        if resolved_path is None:
-            resolved_path = Path(__file__).resolve().parent / "qdrant_local_storage"
-
-        return QdrantClient(path=str(resolved_path), timeout=30), False
 
     def _ensure_collection(self):
         if not self.client.collection_exists(self.collection):

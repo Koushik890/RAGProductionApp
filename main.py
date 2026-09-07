@@ -16,8 +16,8 @@ from dotenv import load_dotenv
 import requests as http_requests
 
 from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
-from data_loader import get_embed_dim, load_and_chunk_pdf, embed_texts
-from vector_db import QdrantStorage
+from data_loader import EmbeddingQuotaExceeded, get_embed_dim, load_and_chunk_pdf, embed_texts
+from vector_db import QdrantStorage, create_client
 
 load_dotenv()
 storage = None
@@ -79,7 +79,12 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     def _upsert(chunks_and_src: RAGChunkAndSrc) -> RAGUpsertResult:
         chunks = chunks_and_src.chunks
         source_id = chunks_and_src.source_id
-        vecs = embed_texts(chunks)
+        try:
+            vecs = embed_texts(chunks)
+        except EmbeddingQuotaExceeded as exc:
+            # Retrying spends more of an already-exhausted quota without ever
+            # succeeding, so fail the run immediately with a readable reason.
+            raise inngest.NonRetriableError(str(exc)) from exc
         ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(vecs))]
         payloads = [{"source_id": source_id, "text": chunks[i]} for i in range(len(chunks))]
         get_storage().upsert(ids, vecs, payloads)
@@ -100,7 +105,10 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 )
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
-        query_vec = embed_texts([question])[0]
+        try:
+            query_vec = embed_texts([question])[0]
+        except EmbeddingQuotaExceeded as exc:
+            raise inngest.NonRetriableError(str(exc)) from exc
         found = get_storage().search(query_vec, top_k)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
 
@@ -170,18 +178,8 @@ def _safe_filename(name: str) -> str:
     return cleaned[-128:]
 
 
-async def fetch_inngest_run(event_id: str) -> dict | None:
-    """Return the latest run for *event_id*, or None if none exists yet.
-
-    Raises HTTPException(429) with Retry-After when Inngest rate limits us, so
-    callers back off instead of hammering the API.
-    """
-    headers = {}
-    if INNGEST_SIGNING_KEY:
-        headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
-
-    url = f"{INNGEST_API_BASE}/events/{event_id}/runs"
-
+async def _get_json(url: str, headers: dict) -> dict:
+    """GET *url*, turning transport and status failures into HTTPExceptions."""
     try:
         resp = await asyncio.to_thread(http_requests.get, url, headers=headers, timeout=10)
     except http_requests.RequestException as exc:
@@ -200,8 +198,33 @@ async def fetch_inngest_run(event_id: str) -> dict | None:
             detail=f"Inngest API returned {resp.status_code}: {resp.text[:500]}",
         )
 
-    runs = resp.json().get("data") or []
-    return runs[0] if runs else None
+    return resp.json()
+
+
+async def fetch_inngest_run(event_id: str) -> dict | None:
+    """Return the latest run for *event_id*, or None if none exists yet.
+
+    Raises HTTPException(429) with Retry-After when Inngest rate limits us, so
+    callers back off instead of hammering the API.
+    """
+    headers = {}
+    if INNGEST_SIGNING_KEY:
+        headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
+
+    runs = (await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)).get("data") or []
+    if not runs:
+        return None
+
+    run = runs[0]
+    run_id = run.get("run_id")
+    if not run_id:
+        return run
+
+    # The events listing is a summary: it can report "Completed" for a run that
+    # is still executing, and it never carries the run output. The per-run
+    # endpoint is the authoritative one.
+    detail = await _get_json(f"{INNGEST_API_BASE}/runs/{run_id}", headers)
+    return detail.get("data") or run
 
 
 def _describe_run(run: dict) -> dict:
@@ -236,22 +259,35 @@ async def health_deps():
     not say which. This names the broken one directly.
     """
 
-    def _check_embeddings() -> None:
-        embed_texts(["ping"])
+    def _check_embeddings() -> int:
+        return get_embed_dim()
 
-    def _check_qdrant() -> None:
-        # Cosine distance rejects a zero vector, so probe with a unit vector.
-        probe = [1.0] + [0.0] * (get_embed_dim() - 1)
-        get_storage().search(probe, 1)
+    def _check_qdrant() -> list[str]:
+        # Deliberately avoids get_embed_dim(): the two checks must fail
+        # independently, or an embedding outage reports Qdrant as broken too.
+        if storage is not None:
+            client, close_after = storage.client, False
+        else:
+            client, _ = create_client()
+            close_after = True
+        try:
+            return [c.name for c in client.get_collections().collections]
+        finally:
+            if close_after:
+                client.close()
 
     results: dict[str, dict] = {}
     for name, check in (("embeddings", _check_embeddings), ("qdrant", _check_qdrant)):
         try:
-            await asyncio.to_thread(check)
+            detail = await asyncio.to_thread(check)
         except Exception as exc:
-            results[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            results[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
         else:
             results[name] = {"ok": True}
+            if name == "embeddings":
+                results[name]["dim"] = detail
+            else:
+                results[name]["collections"] = detail
 
     return results
 

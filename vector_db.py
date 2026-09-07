@@ -1,5 +1,6 @@
 import logging
 import os
+import urllib.parse
 from pathlib import Path
 
 from qdrant_client import QdrantClient
@@ -16,6 +17,33 @@ def _recreate_allowed() -> bool:
     `QDRANT_ALLOW_RECREATE=false` to fail loudly instead of dropping it.
     """
     return os.getenv("QDRANT_ALLOW_RECREATE", "true").lower() != "false"
+
+
+def describe_target() -> str:
+    """Where Qdrant requests are being sent, safe to expose.
+
+    /health/deps is public, so the cluster id is masked. Scheme and port are
+    kept because they are what actually distinguishes the common
+    misconfigurations: Qdrant Cloud speaks REST on 6333 and gRPC on 6334, and
+    pointing a REST client at the gRPC port resets the connection, as does
+    plain http against a TLS endpoint.
+    """
+    url = os.getenv("QDRANT_URL")
+    if not url:
+        return "embedded (QDRANT_URL is not set)"
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or "?"
+    labels = host.split(".")
+    if len(labels) > 2:
+        labels[0] = "***"
+    masked = ".".join(labels)
+
+    port = parsed.port
+    if port is None:
+        port = f"default:{443 if parsed.scheme == 'https' else 80}"
+
+    return f"{parsed.scheme}://{masked}:{port}"
 
 
 def create_client(url=None, path=None):

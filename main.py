@@ -25,7 +25,7 @@ from data_loader import (
     get_embed_dim,
     load_and_chunk_pdf,
 )
-from vector_db import QdrantStorage, create_client
+from vector_db import QdrantStorage, create_client, describe_target
 
 load_dotenv()
 storage = None
@@ -338,6 +338,10 @@ async def health_deps():
                 results[name]["dim"] = detail
             else:
                 results[name]["collections"] = detail
+
+    # A connection error says nothing about which endpoint was dialled, which
+    # is the one thing needed to tell a wrong port from a dead cluster.
+    results["qdrant"]["target"] = describe_target()
 
     return results
 

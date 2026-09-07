@@ -3,6 +3,7 @@ import logging
 import datetime
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -55,6 +56,9 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 ANSWER_MODEL = os.getenv("ANSWER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
+
+# Return raw exception text to clients. For local debugging only.
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "false").lower() == "true"
 
 INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").rstrip("/")
 INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
@@ -175,6 +179,36 @@ RUN_STATES_OK = {"Completed", "Succeeded", "Success", "Finished"}
 RUN_STATES_BAD = {"Failed", "Cancelled"}
 
 
+# A run id never changes for a given event, so the events listing only needs to
+# be hit until one is discovered. Without this, every poll costs two Inngest
+# requests, which at a 3s interval is enough to attract rate limiting again.
+_RUN_ID_CACHE: dict[str, tuple[str, float]] = {}
+_RUN_ID_CACHE_TTL_S = float(os.getenv("RUN_ID_CACHE_TTL_S", "3600"))
+_RUN_ID_CACHE_MAX = int(os.getenv("RUN_ID_CACHE_MAX", "1024"))
+
+
+def _cached_run_id(event_id: str) -> str | None:
+    entry = _RUN_ID_CACHE.get(event_id)
+    if entry is None:
+        return None
+
+    run_id, stored_at = entry
+    if time.monotonic() - stored_at > _RUN_ID_CACHE_TTL_S:
+        _RUN_ID_CACHE.pop(event_id, None)
+        return None
+
+    return run_id
+
+
+def _cache_run_id(event_id: str, run_id: str) -> None:
+    if len(_RUN_ID_CACHE) >= _RUN_ID_CACHE_MAX:
+        # Cheap bound: drop the oldest entry rather than grow without limit.
+        oldest = min(_RUN_ID_CACHE, key=lambda k: _RUN_ID_CACHE[k][1])
+        _RUN_ID_CACHE.pop(oldest, None)
+
+    _RUN_ID_CACHE[event_id] = (run_id, time.monotonic())
+
+
 def _safe_filename(name: str) -> str:
     """Turn a client-supplied filename into a safe basename inside UPLOADS_DIR."""
     base = Path(name or "").name
@@ -219,14 +253,21 @@ async def fetch_inngest_run(event_id: str) -> dict | None:
     if INNGEST_SIGNING_KEY:
         headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
 
-    runs = (await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)).get("data") or []
-    if not runs:
-        return None
+    run = None
+    run_id = _cached_run_id(event_id)
 
-    run = runs[0]
-    run_id = run.get("run_id")
-    if not run_id:
-        return run
+    if run_id is None:
+        listing = await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)
+        runs = listing.get("data") or []
+        if not runs:
+            return None
+
+        run = runs[0]
+        run_id = run.get("run_id")
+        if not run_id:
+            return run
+
+        _cache_run_id(event_id, run_id)
 
     # The events listing is a summary: it can report "Completed" for a run that
     # is still executing, and it never carries the run output. The per-run
@@ -327,7 +368,13 @@ async def upload_pdf(file: UploadFile = File(...)):
         )
 
     filename = _safe_filename(file.filename)
-    file_path = UPLOADS_DIR / filename
+
+    # /upload now returns before the ingestion step opens the file, so two
+    # uploads sharing a name would race and the second could overwrite the
+    # first mid-run. Give every upload its own path. source_id stays the plain
+    # filename: chunk ids are derived from it, so re-ingesting a document
+    # replaces its vectors instead of duplicating them.
+    file_path = UPLOADS_DIR / f"{uuid.uuid4().hex}-{filename}"
     file_path.write_bytes(contents)
 
     try:
@@ -341,6 +388,8 @@ async def upload_pdf(file: UploadFile = File(...)):
             )
         )
     except Exception as exc:  # SendEventsError plus transport failures
+        # Nothing will ever read this file, so do not leave it behind.
+        file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=502, detail=f"Could not queue ingestion: {exc}") from exc
 
     # Return straight away. The client polls /status/{event_id}. Holding the
@@ -374,13 +423,26 @@ async def query_pdf(req: QueryRequest):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request, exc: Exception):
-    """Answer with JSON so clients can show a real reason.
+    """Answer with JSON so clients can show something actionable.
 
     Without this, Starlette returns a bare `Internal Server Error` body and the
-    UI has nothing useful to display.
+    UI has nothing to display. The exception text itself stays server-side: it
+    can carry filesystem paths, or credentials embedded in a dependency's
+    message. The returned id ties the response to the logged traceback. Step
+    failures, which are the errors users actually need, still reach the UI
+    through /status.
     """
-    logging.getLogger("uvicorn").exception("Unhandled error on %s", request.url.path)
-    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+    error_id = uuid.uuid4().hex[:12]
+    logging.getLogger("uvicorn").exception(
+        "Unhandled error %s on %s", error_id, request.url.path
+    )
+
+    detail = (
+        f"{type(exc).__name__}: {exc}"
+        if DEBUG_ERRORS
+        else f"Internal server error. Reference {error_id} in the server logs."
+    )
+    return JSONResponse(status_code=500, content={"detail": detail, "error_id": error_id})
 
 
 # --------------- Register Inngest functions --------------------------------

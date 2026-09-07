@@ -76,6 +76,7 @@ Required for core functionality:
 | `EMBED_INPUT_TYPE` | No | auto | Send NVIDIA's `input_type`/`truncate` parameters. Auto-enabled for NVIDIA endpoints. |
 | `EMBED_TRUNCATE` | No | `END` | How NIM truncates input longer than the model context. |
 | `ANSWER_MAX_TOKENS` | No | `4096` | Token budget for the answer, including reasoning tokens. |
+| `DEBUG_ERRORS` | No | `false` | Return raw exception text on unhandled errors. Local debugging only. |
 
 Qdrant configuration:
 
@@ -101,6 +102,8 @@ App/UI configuration:
 | --- | --- | --- | --- |
 | `UPLOADS_DIR` | No | `uploads` | Directory where uploaded PDFs are stored. |
 | `MAX_UPLOAD_BYTES` | No | `20971520` | Maximum accepted PDF size in bytes. |
+| `RUN_ID_CACHE_TTL_S` | No | `3600` | How long a discovered Inngest run id is cached per event. |
+| `RUN_ID_CACHE_MAX` | No | `1024` | Maximum cached run ids before the oldest is dropped. |
 | `BACKEND_URL` | No | `http://127.0.0.1:8000` | FastAPI base URL used by Streamlit UI. |
 
 ## Local Development Setup
@@ -253,6 +256,14 @@ For production, use:
   to raise an error instead of dropping a remote collection.
 - Changing `EMBED_MODEL` therefore invalidates everything already ingested.
 - `/upload` returns immediately; the client polls `/status/{event_id}` until the run ends.
+- Each upload is stored under its own generated path, so two uploads of the same
+  filename cannot overwrite each other before ingestion reads them. `source_id`
+  stays the plain filename, so re-ingesting a document replaces its vectors
+  rather than duplicating them.
+- The first `/status` call resolves the run id and caches it, so later polls make
+  a single Inngest request instead of two.
+- Unhandled server errors return a reference id, not the exception text. Step
+  failures still reach the client through `/status`.
 - NVIDIA NIM's free tier is rate limited per minute (roughly 40 requests) rather
   than capped per day. Handle 429 with backoff; the app already does.
 - NVIDIA embedding models are asymmetric: documents are embedded with

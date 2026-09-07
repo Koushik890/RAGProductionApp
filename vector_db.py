@@ -55,6 +55,17 @@ class QdrantStorage:
         if current_dim == self.dim:
             return
 
+        if current_dim is None:
+            # Named-vector collections expose a mapping rather than a single
+            # size. Treating "unknown" as "mismatched" would delete a
+            # collection this app simply does not understand.
+            raise RuntimeError(
+                f"Collection '{self.collection}' does not expose a single vector size, so it "
+                f"cannot be compared against the embedding model's {self.dim} dimensions. It "
+                f"may use named vectors. Inspect it manually, or point QDRANT_COLLECTION at a "
+                f"different name."
+            )
+
         if self.is_remote and not _recreate_allowed():
             raise RuntimeError(
                 f"Collection '{self.collection}' is configured for vectors of size {current_dim}, "

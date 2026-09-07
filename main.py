@@ -253,27 +253,41 @@ async def fetch_inngest_run(event_id: str) -> dict | None:
     if INNGEST_SIGNING_KEY:
         headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
 
-    run = None
-    run_id = _cached_run_id(event_id)
+    listing = await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)
+    runs = listing.get("data") or []
+    if not runs:
+        return None
 
-    if run_id is None:
-        listing = await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)
-        runs = listing.get("data") or []
-        if not runs:
-            return None
+    run = runs[0]
+    status = run.get("status")
 
-        run = runs[0]
-        run_id = run.get("run_id")
-        if not run_id:
-            return run
+    # Still executing. The listing only ever reports a terminal status too
+    # early, never too late, so a non-terminal status can be trusted as-is and
+    # costs one request per poll.
+    if status not in RUN_STATES_OK and status not in RUN_STATES_BAD:
+        return run
 
-        _cache_run_id(event_id, run_id)
+    # Inngest Cloud returns a complete record here, output included, so a
+    # finished run also costs one request. The dev server is the odd one out:
+    # its listing can report "Completed" for a run that is still going, and it
+    # never carries output. Both of those show up as a terminal status with no
+    # ended_at or no output, which is the only case worth a second request.
+    if run.get("ended_at") and "output" in run:
+        return run
 
-    # The events listing is a summary: it can report "Completed" for a run that
-    # is still executing, and it never carries the run output. The per-run
-    # endpoint is the authoritative one.
-    detail = await _get_json(f"{INNGEST_API_BASE}/runs/{run_id}", headers)
-    return detail.get("data") or run
+    run_id = _cached_run_id(event_id) or run.get("run_id")
+    if not run_id:
+        return run
+
+    _cache_run_id(event_id, run_id)
+
+    detail = (await _get_json(f"{INNGEST_API_BASE}/runs/{run_id}", headers)).get("data") or {}
+
+    # Merge rather than replace: each source carries a field the other omits.
+    # Skip nulls so an absent value never overwrites a present one.
+    merged = dict(run)
+    merged.update({k: v for k, v in detail.items() if v is not None})
+    return merged
 
 
 def _describe_run(run: dict) -> dict:

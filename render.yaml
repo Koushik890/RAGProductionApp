@@ -11,16 +11,22 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
-      - key: MISTRAL_API_KEY
-        sync: false                    # set manually in the dashboard
+      - key: LLM_API_KEY
+        sync: false                    # NVIDIA NIM key, set in the dashboard
+      - key: LLM_BASE_URL
+        value: "https://integrate.api.nvidia.com/v1"
+      - key: EMBED_MODEL
+        value: "nvidia/nemotron-3-embed-1b"
+      - key: ANSWER_MODEL
+        value: "nvidia/nemotron-3-super-120b-a12b"
+      # EMBED_DIM is left unset on purpose: the app probes the embedding model
+      # once and sizes the Qdrant collection to match.
       - key: QDRANT_URL
         sync: false                    # e.g. https://xyz.us-east.aws.cloud.qdrant.io:6333
       - key: QDRANT_API_KEY
         sync: false                    # Qdrant Cloud API key
       - key: QDRANT_COLLECTION
         value: docs
-      - key: MISTRAL_EMBED_DIM
-        value: "1024"
       - key: INNGEST_PRODUCTION
         value: "true"
       - key: INNGEST_EVENT_KEY

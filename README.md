@@ -11,14 +11,14 @@ This repository provides:
 - A `Streamlit` frontend for uploading PDFs and asking questions.
 - `Inngest` functions to orchestrate ingestion and query workflows.
 - `Qdrant` vector storage (local embedded mode or remote cloud mode).
-- `Mistral` embeddings and LLM inference.
+- `NVIDIA NIM` for embeddings and LLM inference (any OpenAI-compatible provider works).
 
 ## What This App Does
 
 1. You upload a PDF from the Streamlit UI.
 2. The backend extracts text, chunks it, creates embeddings, and stores vectors in Qdrant.
 3. You ask a question.
-4. The backend retrieves relevant chunks, sends context to Mistral, and returns a grounded answer with sources.
+4. The backend retrieves relevant chunks, sends context to the answer model, and returns a grounded answer with sources.
 
 ## Architecture
 
@@ -45,13 +45,13 @@ Core modules:
 - Streamlit
 - Inngest
 - Qdrant
-- Mistral API
+- NVIDIA NIM API (OpenAI-compatible)
 - LlamaIndex file reader + text splitter
 
 ## Prerequisites
 
 - Python `3.13` (see `.python-version`)
-- A Mistral API key
+- An NVIDIA NIM API key from build.nvidia.com
 - One of the following for vector storage:
 	- Local embedded Qdrant (default, no extra service required)
 	- Qdrant Cloud / remote Qdrant (`QDRANT_URL` + `QDRANT_API_KEY`)
@@ -67,8 +67,16 @@ Required for core functionality:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `MISTRAL_API_KEY` | Yes | - | API key for embeddings and answer generation. |
-| `MISTRAL_EMBED_DIM` | No | `1024` | Embedding vector dimension used for Qdrant collection. |
+| `LLM_API_KEY` | Yes | - | API key for embeddings and answer generation. `NVIDIA_API_KEY`, `NIM_API_KEY` and `OPENROUTER_API_KEY` are also accepted. |
+| `LLM_BASE_URL` | No | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible base URL. Point it at another provider to switch. |
+| `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b` | Embedding model. Produces 2048-dim vectors. |
+| `ANSWER_MODEL` | No | `nvidia/nemotron-3-super-120b-a12b` | Answer generation model. |
+| `EMBED_DIM` | No | probed once | Embedding vector size. Leave unset to detect it from the model. |
+| `EMBED_BATCH_SIZE` | No | `64` | Chunks sent per embedding request. |
+| `EMBED_INPUT_TYPE` | No | auto | Send NVIDIA's `input_type`/`truncate` parameters. Auto-enabled for NVIDIA endpoints. |
+| `EMBED_TRUNCATE` | No | `END` | How NIM truncates input longer than the model context. |
+| `ANSWER_MAX_TOKENS` | No | `4096` | Token budget for the answer, including reasoning tokens. |
+| `DEBUG_ERRORS` | No | `false` | Return raw exception text on unhandled errors. Local debugging only. |
 
 Qdrant configuration:
 
@@ -93,6 +101,9 @@ App/UI configuration:
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `UPLOADS_DIR` | No | `uploads` | Directory where uploaded PDFs are stored. |
+| `MAX_UPLOAD_BYTES` | No | `20971520` | Maximum accepted PDF size in bytes. |
+| `RUN_ID_CACHE_TTL_S` | No | `3600` | How long a discovered Inngest run id is cached per event. |
+| `RUN_ID_CACHE_MAX` | No | `1024` | Maximum cached run ids before the oldest is dropped. |
 | `BACKEND_URL` | No | `http://127.0.0.1:8000` | FastAPI base URL used by Streamlit UI. |
 
 ## Local Development Setup
@@ -122,10 +133,12 @@ uv sync
 Create `.env` with at least:
 
 ```env
-MISTRAL_API_KEY=your_mistral_key
-# Optional but recommended for clarity
-MISTRAL_EMBED_DIM=1024
+LLM_API_KEY=your_nvidia_nim_key
 QDRANT_COLLECTION=docs
+# Optional: pin provider and models. These are the defaults.
+LLM_BASE_URL=https://integrate.api.nvidia.com/v1
+EMBED_MODEL=nvidia/nemotron-3-embed-1b
+ANSWER_MODEL=nvidia/nemotron-3-super-120b-a12b
 ```
 
 For local embedded Qdrant, no extra setup is required.
@@ -163,17 +176,38 @@ Base URL: `http://127.0.0.1:8000`
 - `GET /health`
 	- Returns service health.
 
+- `GET /health/deps`
+	- Checks the embedding provider and Qdrant, the two dependencies every Inngest step needs.
+	- Response: `{ "embeddings": {"ok": true}, "qdrant": {"ok": false, "error": "..."} }`
+	- Use it when a run fails: it names the broken dependency instead of leaving
+	  every failure looking the same.
+
 - `POST /upload`
 	- Accepts multipart form-data with a PDF file.
-	- Triggers ingestion and waits for completion.
-	- Returns ingestion status and source info.
+	- Queues ingestion and returns `202` immediately with an `event_id`.
+	- Response: `{ "status": "ingestion_started", "event_id": "...", "source_id": "..." }`
 
 - `POST /query`
 	- JSON body:
 		```json
 		{ "question": "What is this document about?", "top_k": 5 }
 		```
-	- Triggers query workflow and returns answer + sources.
+	- Queues the query workflow and returns `202` with an `event_id`.
+	- Response: `{ "status": "query_started", "event_id": "..." }`
+
+- `GET /status/{event_id}`
+	- Polls the Inngest run started by `/upload` or `/query`.
+	- Returns one of:
+		- `{ "state": "pending" }` - no run created yet
+		- `{ "state": "running", "status": "..." }`
+		- `{ "state": "completed", "output": { ... } }`
+		- `{ "state": "failed", "error": { ... } }`
+	- Returns `429` with a `Retry-After` header if the Inngest API rate limits the poll.
+
+Both long-running workflows are polled rather than awaited inside the request.
+Holding a request open for the whole ingestion piles up long-lived connections
+on the instance and trips upstream rate limiting - that is the `Too Many Requests`
+the UI used to show.
 
 Interactive API docs:
 - `http://127.0.0.1:8000/docs`
@@ -185,6 +219,12 @@ Upload a PDF:
 ```bash
 curl -X POST "http://127.0.0.1:8000/upload" \
 	-F "file=@./sample.pdf"
+```
+
+Then poll the run until it finishes:
+
+```bash
+curl "http://127.0.0.1:8000/status/<event_id>"
 ```
 
 Ask a question:
@@ -201,7 +241,7 @@ curl -X POST "http://127.0.0.1:8000/query" \
 - `rag-api`: FastAPI backend
 - `rag-ui`: Streamlit frontend
 
-Set sensitive values (`MISTRAL_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
+Set sensitive values (`LLM_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, Inngest keys) in the Render dashboard.
 
 For production, use:
 - Inngest Cloud (`INNGEST_API_BASE=https://api.inngest.com/v1`)
@@ -210,21 +250,41 @@ For production, use:
 ## Operational Notes
 
 - Local mode defaults to embedded Qdrant storage in `qdrant_local_storage/`.
-- If embedding dimension changes, local collection is recreated automatically.
-- If using remote Qdrant and dimensions do not match, startup raises an error (collection must be recreated or config corrected).
-- `/upload` waits for ingestion completion, so first response can take time for larger PDFs.
+- The embedding vector size is probed once from `EMBED_MODEL` unless `EMBED_DIM` is set.
+- If the collection's vector size does not match the embedding model, it is dropped and
+  recreated, and every document must be re-uploaded. Set `QDRANT_ALLOW_RECREATE=false`
+  to raise an error instead of dropping a remote collection.
+- Changing `EMBED_MODEL` therefore invalidates everything already ingested.
+- `/upload` returns immediately; the client polls `/status/{event_id}` until the run ends.
+- Each upload is stored under its own generated path, so two uploads of the same
+  filename cannot overwrite each other before ingestion reads them. `source_id`
+  stays the plain filename, so re-ingesting a document replaces its vectors
+  rather than duplicating them.
+- The first `/status` call resolves the run id and caches it, so later polls make
+  a single Inngest request instead of two.
+- Unhandled server errors return a reference id, not the exception text. Step
+  failures still reach the client through `/status`.
+- NVIDIA NIM's free tier is rate limited per minute (roughly 40 requests) rather
+  than capped per day. Handle 429 with backoff; the app already does.
+- NVIDIA embedding models are asymmetric: documents are embedded with
+  `input_type=passage` and questions with `input_type=query`. Mixing the two
+  degrades retrieval.
 
 ## Troubleshooting
 
-- `RuntimeError: MISTRAL_API_KEY is not set`
-	- Add `MISTRAL_API_KEY` to `.env` and restart services.
+- `RuntimeError: No API key set`
+	- Add `LLM_API_KEY` to `.env` and restart services.
+
+- Every ingestion and query fails with the same error
+	- Call `GET /health/deps` to see whether the embedding provider or Qdrant is broken.
 
 - Inngest polling timeout (`Timed out waiting for Inngest run`)
 	- Ensure Inngest dev/cloud is running and reachable.
 	- Confirm `INNGEST_API_BASE` and keys are correct.
 
 - Vector dimension mismatch with remote Qdrant
-	- Match `MISTRAL_EMBED_DIM` with collection dimension, or recreate collection.
+	- The collection is rebuilt automatically. Re-upload your PDFs afterwards.
+	- Set `EMBED_DIM` only if you want to skip the probe and pin the size yourself.
 
 - Streamlit cannot reach backend
 	- Verify `BACKEND_URL` and that FastAPI is running.

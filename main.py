@@ -2,11 +2,13 @@ import asyncio
 import logging
 import datetime
 import os
+import re
 import time
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import inngest
 import inngest.fast_api
@@ -15,8 +17,15 @@ from dotenv import load_dotenv
 import requests as http_requests
 
 from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
-from data_loader import EMBED_DIM, load_and_chunk_pdf, embed_texts
-from vector_db import QdrantStorage
+from data_loader import (
+    LLM_BASE_URL,
+    EmbeddingQuotaExceeded,
+    embed_texts,
+    get_api_key,
+    get_embed_dim,
+    load_and_chunk_pdf,
+)
+from vector_db import QdrantStorage, create_client
 
 load_dotenv()
 storage = None
@@ -26,7 +35,7 @@ def get_storage() -> QdrantStorage:
     global storage
 
     if storage is None:
-        storage = QdrantStorage(dim=EMBED_DIM)
+        storage = QdrantStorage(dim=get_embed_dim())
 
     return storage
 
@@ -43,7 +52,15 @@ def close_storage() -> None:
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
+
+# Return raw exception text to clients. For local debugging only.
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "false").lower() == "true"
+
+INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").rstrip("/")
 INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
 
 inngest_client = inngest.Inngest(
@@ -56,7 +73,7 @@ inngest_client = inngest.Inngest(
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
     trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
-    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/Mistral
+    # Limit ingestion to 5 concurrent runs to avoid overloading Qdrant/the LLM provider
     concurrency=[inngest.Concurrency(limit=5)],
     # Throttle to max 10 ingestions per minute
     throttle=inngest.Throttle(limit=10, period=datetime.timedelta(minutes=1)),
@@ -72,7 +89,12 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     def _upsert(chunks_and_src: RAGChunkAndSrc) -> RAGUpsertResult:
         chunks = chunks_and_src.chunks
         source_id = chunks_and_src.source_id
-        vecs = embed_texts(chunks)
+        try:
+            vecs = embed_texts(chunks, input_type="passage")
+        except EmbeddingQuotaExceeded as exc:
+            # Retrying spends more of an already-exhausted quota without ever
+            # succeeding, so fail the run immediately with a readable reason.
+            raise inngest.NonRetriableError(str(exc)) from exc
         ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(vecs))]
         payloads = [{"source_id": source_id, "text": chunks[i]} for i in range(len(chunks))]
         get_storage().upsert(ids, vecs, payloads)
@@ -93,7 +115,12 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 )
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
-        query_vec = embed_texts([question])[0]
+        try:
+            # A question is a query, not a document. Asymmetric embedding
+            # models score the two differently, so the label matters.
+            query_vec = embed_texts([question], input_type="query")[0]
+        except EmbeddingQuotaExceeded as exc:
+            raise inngest.NonRetriableError(str(exc)) from exc
         found = get_storage().search(query_vec, top_k)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
 
@@ -111,16 +138,18 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     )
 
     adapter = ai.openai.Adapter(
-        auth_key=os.getenv("MISTRAL_API_KEY"),
-        base_url="https://api.mistral.ai/v1",
-        model="mistral-large-latest",
+        auth_key=get_api_key(),
+        base_url=LLM_BASE_URL,
+        model=ANSWER_MODEL,
     )
 
     res = await ctx.step.ai.infer(
         "llm-answer",
         adapter=adapter,
         body={
-            "max_tokens": 1024,
+            # Reasoning models spend part of this budget thinking before they
+            # emit any answer text, so it has to be well above the answer length.
+            "max_tokens": ANSWER_MAX_TOKENS,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": "You answer questions using only the provided context."},
@@ -129,41 +158,137 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
         }
     )
 
-    answer = res["choices"][0]["message"]["content"].strip()
+    message = res["choices"][0]["message"]
+    answer = (message.get("content") or "").strip()
+    if not answer:
+        # Reasoning models sometimes leave `content` null and put the text in
+        # `reasoning` instead. Fall back rather than crashing on None.
+        answer = (message.get("reasoning") or "").strip()
+    if not answer:
+        raise RuntimeError("The model returned an empty answer")
+
     return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
 
 app = FastAPI()
 
 
-# --------------- Inngest polling helper ------------------------------------
+# --------------- Inngest run status helpers --------------------------------
+
+# Terminal states reported by the Inngest REST API.
+RUN_STATES_OK = {"Completed", "Succeeded", "Success", "Finished"}
+RUN_STATES_BAD = {"Failed", "Cancelled"}
 
 
-async def poll_inngest_run(event_id: str, timeout_s: float = 120.0, poll_interval_s: float = 0.5) -> dict:
-    """Poll the Inngest API until the run triggered by *event_id* finishes."""
+# A run id never changes for a given event, so the events listing only needs to
+# be hit until one is discovered. Without this, every poll costs two Inngest
+# requests, which at a 3s interval is enough to attract rate limiting again.
+_RUN_ID_CACHE: dict[str, tuple[str, float]] = {}
+_RUN_ID_CACHE_TTL_S = float(os.getenv("RUN_ID_CACHE_TTL_S", "3600"))
+_RUN_ID_CACHE_MAX = int(os.getenv("RUN_ID_CACHE_MAX", "1024"))
+
+
+def _cached_run_id(event_id: str) -> str | None:
+    entry = _RUN_ID_CACHE.get(event_id)
+    if entry is None:
+        return None
+
+    run_id, stored_at = entry
+    if time.monotonic() - stored_at > _RUN_ID_CACHE_TTL_S:
+        _RUN_ID_CACHE.pop(event_id, None)
+        return None
+
+    return run_id
+
+
+def _cache_run_id(event_id: str, run_id: str) -> None:
+    if len(_RUN_ID_CACHE) >= _RUN_ID_CACHE_MAX:
+        # Cheap bound: drop the oldest entry rather than grow without limit.
+        oldest = min(_RUN_ID_CACHE, key=lambda k: _RUN_ID_CACHE[k][1])
+        _RUN_ID_CACHE.pop(oldest, None)
+
+    _RUN_ID_CACHE[event_id] = (run_id, time.monotonic())
+
+
+def _safe_filename(name: str) -> str:
+    """Turn a client-supplied filename into a safe basename inside UPLOADS_DIR."""
+    base = Path(name or "").name
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    if not cleaned:
+        cleaned = "upload.pdf"
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned = f"{cleaned}.pdf"
+    return cleaned[-128:]
+
+
+async def _get_json(url: str, headers: dict) -> dict:
+    """GET *url*, turning transport and status failures into HTTPExceptions."""
+    try:
+        resp = await asyncio.to_thread(http_requests.get, url, headers=headers, timeout=10)
+    except http_requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach Inngest API: {exc}") from exc
+
+    if resp.status_code == 429:
+        raise HTTPException(
+            status_code=429,
+            detail="Inngest API rate limit reached; retry shortly.",
+            headers={"Retry-After": resp.headers.get("Retry-After", "5")},
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Inngest API returned {resp.status_code}: {resp.text[:500]}",
+        )
+
+    return resp.json()
+
+
+async def fetch_inngest_run(event_id: str) -> dict | None:
+    """Return the latest run for *event_id*, or None if none exists yet.
+
+    Raises HTTPException(429) with Retry-After when Inngest rate limits us, so
+    callers back off instead of hammering the API.
+    """
     headers = {}
     if INNGEST_SIGNING_KEY:
         headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
 
-    url = f"{INNGEST_API_BASE}/events/{event_id}/runs"
-    start = time.time()
+    run = None
+    run_id = _cached_run_id(event_id)
 
-    while True:
-        resp = await asyncio.to_thread(http_requests.get, url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        runs = resp.json().get("data", [])
+    if run_id is None:
+        listing = await _get_json(f"{INNGEST_API_BASE}/events/{event_id}/runs", headers)
+        runs = listing.get("data") or []
+        if not runs:
+            return None
 
-        if runs:
-            run = runs[0]
-            status = run.get("status")
-            if status in ("Completed", "Succeeded", "Success", "Finished"):
-                return run.get("output") or {}
-            if status in ("Failed", "Cancelled"):
-                raise HTTPException(status_code=502, detail=f"Inngest function run {status}")
+        run = runs[0]
+        run_id = run.get("run_id")
+        if not run_id:
+            return run
 
-        if time.time() - start > timeout_s:
-            raise HTTPException(status_code=504, detail="Timed out waiting for Inngest run")
+        _cache_run_id(event_id, run_id)
 
-        await asyncio.sleep(poll_interval_s)
+    # The events listing is a summary: it can report "Completed" for a run that
+    # is still executing, and it never carries the run output. The per-run
+    # endpoint is the authoritative one.
+    detail = await _get_json(f"{INNGEST_API_BASE}/runs/{run_id}", headers)
+    return detail.get("data") or run
+
+
+def _describe_run(run: dict) -> dict:
+    """Normalise an Inngest run record into the shape the UI polls for."""
+    status = run.get("status")
+
+    if status in RUN_STATES_OK:
+        return {"state": "completed", "status": status, "output": run.get("output") or {}}
+
+    if status in RUN_STATES_BAD:
+        # Inngest puts the failing step's error in `output`. Surface it instead
+        # of swallowing it, otherwise every failure looks identical.
+        return {"state": "failed", "status": status, "error": run.get("output")}
+
+    return {"state": "running", "status": status}
 
 
 # --------------- API endpoints (routed through Inngest) --------------------
@@ -174,28 +299,103 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/upload")
+@app.get("/health/deps")
+async def health_deps():
+    """Check the two dependencies every Inngest step needs.
+
+    Both `rag/ingest_pdf` and `rag/query_pdf_ai` fail identically when the
+    embedding provider or Qdrant is misconfigured, and the run error alone does
+    not say which. This names the broken one directly.
+    """
+
+    def _check_embeddings() -> int:
+        return get_embed_dim()
+
+
+    def _check_qdrant() -> list[str]:
+        # Deliberately avoids get_embed_dim(): the two checks must fail
+        # independently, or an embedding outage reports Qdrant as broken too.
+        if storage is not None:
+            client, close_after = storage.client, False
+        else:
+            client, _ = create_client()
+            close_after = True
+        try:
+            return [c.name for c in client.get_collections().collections]
+        finally:
+            if close_after:
+                client.close()
+
+    results: dict[str, dict] = {}
+    for name, check in (("embeddings", _check_embeddings), ("qdrant", _check_qdrant)):
+        try:
+            detail = await asyncio.to_thread(check)
+        except Exception as exc:
+            results[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
+        else:
+            results[name] = {"ok": True}
+            if name == "embeddings":
+                results[name]["dim"] = detail
+            else:
+                results[name]["collections"] = detail
+
+    return results
+
+
+@app.get("/status/{event_id}")
+async def run_status(event_id: str):
+    """Poll one Inngest run. Cheap and fast, so it is safe to call every few seconds."""
+    run = await fetch_inngest_run(event_id)
+
+    if run is None:
+        return {"state": "pending"}
+
+    return _describe_run(run)
+
+
+@app.post("/upload", status_code=202)
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
+    if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
-    file_path = UPLOADS_DIR / file.filename
     contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF is larger than the {MAX_UPLOAD_BYTES} byte limit",
+        )
+
+    filename = _safe_filename(file.filename)
+
+    # /upload now returns before the ingestion step opens the file, so two
+    # uploads sharing a name would race and the second could overwrite the
+    # first mid-run. Give every upload its own path. source_id stays the plain
+    # filename: chunk ids are derived from it, so re-ingesting a document
+    # replaces its vectors instead of duplicating them.
+    file_path = UPLOADS_DIR / f"{uuid.uuid4().hex}-{filename}"
     file_path.write_bytes(contents)
 
-    event_ids = await inngest_client.send(
-        inngest.Event(
-            name="rag/ingest_pdf",
-            data={
-                "pdf_path": str(file_path.resolve()),
-                "source_id": file.filename,
-            },
+    try:
+        event_ids = await inngest_client.send(
+            inngest.Event(
+                name="rag/ingest_pdf",
+                data={
+                    "pdf_path": str(file_path.resolve()),
+                    "source_id": filename,
+                },
+            )
         )
-    )
+    except Exception as exc:  # SendEventsError plus transport failures
+        # Nothing will ever read this file, so do not leave it behind.
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=f"Could not queue ingestion: {exc}") from exc
 
-    # Wait for ingestion to complete so the user can query immediately after
-    output = await poll_inngest_run(event_ids[0], timeout_s=300.0)
-    return {"status": "ingestion_complete", "source_id": file.filename, **output}
+    # Return straight away. The client polls /status/{event_id}. Holding the
+    # connection open for the whole ingestion is what piled up long-lived
+    # requests on the instance and tripped upstream rate limiting.
+    return {"status": "ingestion_started", "event_id": event_ids[0], "source_id": filename}
 
 
 class QueryRequest(BaseModel):
@@ -203,23 +403,48 @@ class QueryRequest(BaseModel):
     top_k: int = 5
 
 
-@app.post("/query")
+@app.post("/query", status_code=202)
 async def query_pdf(req: QueryRequest):
-    event_ids = await inngest_client.send(
-        inngest.Event(
-            name="rag/query_pdf_ai",
-            data={
-                "question": req.question,
-                "top_k": req.top_k,
-            },
+    try:
+        event_ids = await inngest_client.send(
+            inngest.Event(
+                name="rag/query_pdf_ai",
+                data={
+                    "question": req.question,
+                    "top_k": req.top_k,
+                },
+            )
         )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not queue query: {exc}") from exc
+
+    return {"status": "query_started", "event_id": event_ids[0]}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception):
+    """Answer with JSON so clients can show something actionable.
+
+    Without this, Starlette returns a bare `Internal Server Error` body and the
+    UI has nothing to display. The exception text itself stays server-side: it
+    can carry filesystem paths, or credentials embedded in a dependency's
+    message. The returned id ties the response to the logged traceback. Step
+    failures, which are the errors users actually need, still reach the UI
+    through /status.
+    """
+    error_id = uuid.uuid4().hex[:12]
+    logging.getLogger("uvicorn").exception(
+        "Unhandled error %s on %s", error_id, request.url.path
     )
 
-    output = await poll_inngest_run(event_ids[0])
-    return output
+    detail = (
+        f"{type(exc).__name__}: {exc}"
+        if DEBUG_ERRORS
+        else f"Internal server error. Reference {error_id} in the server logs."
+    )
+    return JSONResponse(status_code=500, content={"detail": detail, "error_id": error_id})
 
 
 # --------------- Register Inngest functions --------------------------------
 
 inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
-

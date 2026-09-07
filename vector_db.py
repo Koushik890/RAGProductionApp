@@ -1,29 +1,47 @@
+import logging
 import os
 from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
+logger = logging.getLogger("uvicorn")
+
+
+def _recreate_allowed() -> bool:
+    """Whether a remote collection may be dropped when its vector size is wrong.
+
+    A collection built for a different embedding model cannot be searched or
+    written to, so the app is dead until it is rebuilt. Set
+    `QDRANT_ALLOW_RECREATE=false` to fail loudly instead of dropping it.
+    """
+    return os.getenv("QDRANT_ALLOW_RECREATE", "true").lower() != "false"
+
+
+def create_client(url=None, path=None):
+    """Build a Qdrant client. Returns (client, is_remote).
+
+    Public so a connectivity check can run without knowing the embedding
+    dimension, which requires a live call to the embedding provider.
+    """
+    resolved_url = url or os.getenv("QDRANT_URL")
+    if resolved_url:
+        api_key = os.getenv("QDRANT_API_KEY")
+        return QdrantClient(url=resolved_url, api_key=api_key, timeout=30), True
+
+    resolved_path = path or os.getenv("QDRANT_PATH")
+    if resolved_path is None:
+        resolved_path = Path(__file__).resolve().parent / "qdrant_local_storage"
+
+    return QdrantClient(path=str(resolved_path), timeout=30), False
+
 
 class QdrantStorage:
     def __init__(self, url=None, path=None, collection=None, dim=1024):
         self.dim = dim
         self.collection = collection or os.getenv("QDRANT_COLLECTION", "docs")
-        self.client, self.is_remote = self._create_client(url=url, path=path)
+        self.client, self.is_remote = create_client(url=url, path=path)
         self._ensure_collection()
-
-    @staticmethod
-    def _create_client(url=None, path=None):
-        resolved_url = url or os.getenv("QDRANT_URL")
-        if resolved_url:
-            api_key = os.getenv("QDRANT_API_KEY")
-            return QdrantClient(url=resolved_url, api_key=api_key, timeout=30), True
-
-        resolved_path = path or os.getenv("QDRANT_PATH")
-        if resolved_path is None:
-            resolved_path = Path(__file__).resolve().parent / "qdrant_local_storage"
-
-        return QdrantClient(path=str(resolved_path), timeout=30), False
 
     def _ensure_collection(self):
         if not self.client.collection_exists(self.collection):
@@ -37,12 +55,31 @@ class QdrantStorage:
         if current_dim == self.dim:
             return
 
-        if self.is_remote:
+        if current_dim is None:
+            # Named-vector collections expose a mapping rather than a single
+            # size. Treating "unknown" as "mismatched" would delete a
+            # collection this app simply does not understand.
             raise RuntimeError(
-                f"Collection '{self.collection}' is configured for vectors of size {current_dim}, "
-                f"but the app is configured for {self.dim}. Recreate the remote collection or update its dimension settings."
+                f"Collection '{self.collection}' does not expose a single vector size, so it "
+                f"cannot be compared against the embedding model's {self.dim} dimensions. It "
+                f"may use named vectors. Inspect it manually, or point QDRANT_COLLECTION at a "
+                f"different name."
             )
 
+        if self.is_remote and not _recreate_allowed():
+            raise RuntimeError(
+                f"Collection '{self.collection}' is configured for vectors of size {current_dim}, "
+                f"but the app is configured for {self.dim}. Recreate the remote collection, or set "
+                f"QDRANT_ALLOW_RECREATE=true to let the app rebuild it (this deletes its contents)."
+            )
+
+        logger.warning(
+            "Collection '%s' has vector size %s but the embedding model produces %s. "
+            "Dropping and recreating it; all previously ingested documents must be re-uploaded.",
+            self.collection,
+            current_dim,
+            self.dim,
+        )
         self.client.delete_collection(self.collection)
         self._create_collection()
 
